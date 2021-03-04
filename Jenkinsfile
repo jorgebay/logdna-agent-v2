@@ -72,6 +72,7 @@ pipeline {
                     }
                 }
                 stage('Run K8s Integration Tests') {
+                    agent { label '!master' }
                     steps {
                         withCredentials([[
                                                  $class: 'AmazonWebServicesCredentialsBinding',
