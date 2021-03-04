@@ -9,6 +9,7 @@ echo "Starting k8s kind build"
 # shellcheck source=/dev/null
 . "$curpath/lib.sh"
 
+kubectl version --client --short || exit 1
 kind --version || exit 1
 
 if [ "$create_cluster" = "true" ]
