@@ -126,7 +126,7 @@ impl FileSystem {
                 if !path_cpy.exists() {
                     path_cpy.pop();
                 } else {
-                    if let Err(e) = fs.insert(&path_cpy, &mut Vec::new(), &mut entries) {
+                    if let Err(e) = fs.insert(&path_cpy, false, &mut Vec::new(), &mut entries) {
                         // It can failed due to permissions or some other restriction
                         debug!(
                             "Initial insertion of {} failed: {}",
@@ -140,7 +140,7 @@ impl FileSystem {
 
             for path in recursive_scan(&dir) {
                 let mut events = Vec::new();
-                if let Err(e) = fs.insert(&path, &mut events, &mut entries) {
+                if let Err(e) = fs.insert(&path, false, &mut events, &mut entries) {
                     // It can failed due to file restrictions
                     debug!(
                         "Initial recursive scan insertion of {} failed: {}",
@@ -287,11 +287,11 @@ impl FileSystem {
         let mut path = self.resolve_direct_path(&entry, _entries);
         path.push(name);
 
-        if let Some(new_entry) = self.insert(&path, events, _entries)? {
+        if let Some(new_entry) = self.insert(&path, false, events, _entries)? {
             let mut errors = vec![];
             if matches!(_entries.get(new_entry), Some(_)) {
                 for new_path in recursive_scan(&path) {
-                    if let Err(e) = self.insert(&new_path, events, _entries) {
+                    if let Err(e) = self.insert(&new_path, false, events, _entries) {
                         errors.push(e);
                     }
                 }
@@ -454,6 +454,7 @@ impl FileSystem {
     fn insert(
         &mut self,
         path: &PathBuf,
+        via_link: bool,
         events: &mut Vec<Event>,
         _entries: &mut EntryMap,
     ) -> FsResult<Option<EntryKey>> {
@@ -511,10 +512,12 @@ impl FileSystem {
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
 
+                info!("!! Creating entry for {:?}", path);
                 let new_entry = Entry::File {
                     name: component,
                     parent: parent_ref,
                     wd,
+                    via_link,
                     data: RefCell::new(TailedFile::new(path).map_err(Error::File)?),
                 };
 
@@ -528,6 +531,7 @@ impl FileSystem {
                     .watch(path)
                     .map_err(|e| Error::Watch(path.to_owned(), e))?;
 
+                info!("!! Creating symlink entry for {:?}", path);
                 let new_entry = Entry::Symlink {
                     name: component,
                     parent: parent_ref,
@@ -539,7 +543,7 @@ impl FileSystem {
                 let new_key = self.register_as_child(parent_ref, new_entry, _entries)?;
 
                 if self
-                    .insert(&real, events, _entries)
+                    .insert(&real, true, events, _entries)
                     .unwrap_or(None)
                     .is_none()
                 {
@@ -727,7 +731,7 @@ impl FileSystem {
                     .ok_or(Error::ParentNotValid)?
                     .insert(new_name, entry_key))
             }
-            None => self.insert(to, events, _entries),
+            None => self.insert(to, false, events, _entries),
         }
     }
 

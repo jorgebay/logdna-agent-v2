@@ -17,6 +17,7 @@ pub enum Entry {
         parent: EntryKey,
         wd: WatchDescriptor,
         data: RefCell<TailedFile<LazyLineSerializer>>,
+        via_link: bool,
     },
     Dir {
         name: OsString,

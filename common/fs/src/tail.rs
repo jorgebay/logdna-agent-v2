@@ -2,7 +2,7 @@ use crate::cache::entry::Entry;
 use crate::cache::event::Event;
 use crate::cache::tailed_file::LazyLineSerializer;
 pub use crate::cache::DirPathBuf;
-use crate::cache::FileSystem;
+use crate::cache::{FileSystem, EntryKey};
 use crate::rule::Rules;
 use metrics::Metrics;
 use state::FileName;
@@ -106,42 +106,51 @@ impl Tailer {
                             // will initiate a file to it's current length
                             if let Some(entry) = fs.entries.borrow().get(entry_ptr){
                                 let path = fs.resolve_direct_path(&entry, &fs.entries.borrow());
-                                if let Entry::File { data, .. } = entry {
-                                    match lookback_config {
-                                        Lookback::Start => {
-                                            let offset = match initial_offsets.as_ref() {
-                                                Some(initial_offsets) => {
-                                                    initial_offsets.get(&path.as_os_str().as_bytes().into()).copied().unwrap_or(0)
-                                                }
-                                                None => 0
-                                            };
-                                            info!("initialized {:?} with offset {}", path, offset);
-                                            data.borrow_mut().deref_mut().seek(offset).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
-                                        },
-                                        Lookback::SmallFiles => {
-                                            let offset = match initial_offsets.as_ref() {
-                                                Some(initial_offsets) => {
-                                                    initial_offsets.get(&path.as_os_str().as_bytes().into()).copied().unwrap_or(0)
-                                                }
-                                                None => {
-                                                    let len = path.metadata().map(|m| m.len()).unwrap_or(0);
-                                                    if len < 8192 {
-                                                        0
-                                                    } else{
-                                                        len
+                                if let Entry::File { data, name, via_link, .. } = entry {
+                                    if !via_link {
+                                        info!("!! initialize for {:?}", name);
+                                        match lookback_config {
+                                            Lookback::Start => {
+                                                let offset = match initial_offsets.as_ref() {
+                                                    Some(initial_offsets) => {
+                                                        initial_offsets.get(&path.as_os_str().as_bytes().into()).copied().unwrap_or(0)
                                                     }
-                                                }
-                                            };
-                                            info!("initialized {:?} with offset {}", path, offset);
-                                            data.borrow_mut().deref_mut().seek(offset).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
-                                        },
-                                        Lookback::None => {
-                                            let len = path.metadata().map(|m| m.len()).unwrap_or(0);
-                                            info!("initialized {:?} with offset {}", path, len);
-                                            data.borrow_mut().deref_mut().seek(len).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
+                                                    None => 0
+                                                };
+                                                info!("initialized {:?} with offset {}", path, offset);
+                                                data.borrow_mut().deref_mut().seek(offset).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
+                                            },
+                                            Lookback::SmallFiles => {
+                                                let offset = match initial_offsets.as_ref() {
+                                                    Some(initial_offsets) => {
+                                                        initial_offsets.get(&path.as_os_str().as_bytes().into()).copied().unwrap_or(0)
+                                                    }
+                                                    None => {
+                                                        let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                                        if len < 8192 {
+                                                            0
+                                                        } else {
+                                                            len
+                                                        }
+                                                    }
+                                                };
+                                                info!("initialized {:?} with offset {}", path, offset);
+                                                data.borrow_mut().deref_mut().seek(offset).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
+                                            },
+                                            Lookback::None => {
+                                                let len = path.metadata().map(|m| m.len()).unwrap_or(0);
+                                                info!("initialized {:?} with offset {}", path, len);
+                                                data.borrow_mut().deref_mut().seek(len).await.unwrap_or_else(|e| error!("error seeking {:?}", e))
+                                            }
                                         }
+                                        data.borrow_mut().tail(vec![path]).await
+                                    } else {
+                                        None
                                     }
-                                    data.borrow_mut().tail(vec![path]).await
+                                } else if let Entry::Symlink { name, link, .. } = entry {
+                                    info!("!! link initialise: {:?} -> link: {:?}", name, link);
+                                    // TODO!
+                                    None
                                 } else {
                                     None
                                 }
@@ -189,6 +198,7 @@ impl Tailer {
                                         ..
                                     } = entry
                                     {
+                                        info!("!! Write event for paths {:?}", paths);
                                         data.borrow_mut().deref_mut().tail(paths).await
                                     } else {
                                         None

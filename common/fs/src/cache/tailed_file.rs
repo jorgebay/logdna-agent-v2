@@ -165,7 +165,7 @@ pub struct LazyLineSerializer {
     level: Option<String>,
     meta: Option<Value>,
 
-    path: String,
+    pub path: String,
 
     file_offset: (bytes::Bytes, u64),
 
@@ -442,6 +442,8 @@ impl Stream for LazyLines {
                 buf.clear();
             }
 
+            info!("!! OFFSET: {}", offset);
+
             let pinned_reader = Pin::new(reader);
             let result = ready!(read_until_internal(pinned_reader, cx, b'\n', buf, read));
             match result {
@@ -639,6 +641,8 @@ impl TailedFile<LazyLineSerializer> {
                 return None;
             }
         }
+
+        info!("!! Creating lazy lines for {:?}", paths);
 
         Some(LazyLines::new(
             self.inner.clone(),
