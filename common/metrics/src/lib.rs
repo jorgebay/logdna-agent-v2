@@ -7,11 +7,29 @@ use jemalloc_ctl::{epoch, epoch_mib};
 use json::object;
 use lazy_static::lazy_static;
 use log::info;
+use prometheus::{register_int_counter, register_int_counter_vec};
+use prometheus::{IntCounter, IntCounterVec};
 use std::thread::sleep;
 use std::time::Duration;
 
 lazy_static! {
     static ref METRICS: Metrics = Metrics::new();
+    pub static ref FS_EVENTS: IntCounterVec =
+        register_int_counter_vec!("fs_events", "Filesystem events received", labels::FS_ALL)
+            .unwrap();
+    pub static ref FS_LINES: IntCounter =
+        register_int_counter!("fs_lines", "Filesystem lines parsed").unwrap();
+    pub static ref FS_BYTES: IntCounter =
+        register_int_counter!("fs_bytes", "Filesystem bytes read").unwrap();
+    pub static ref FS_PARTIAL_READS: IntCounter =
+        register_int_counter!("fs_partial_reads", "Filesystem partial reads").unwrap();
+}
+
+mod labels {
+    pub const CREATE: &str = "create";
+    pub const DELETE: &str = "delete";
+    pub const WRITE: &str = "write";
+    pub static FS_ALL: &[&str] = &[CREATE, WRITE, DELETE];
 }
 
 pub struct Metrics {
@@ -79,7 +97,6 @@ impl Metrics {
     }
 
     pub fn print() -> String {
-        let fs = Metrics::fs();
         let memory = Metrics::memory();
         let http = Metrics::http();
         let k8s = Metrics::k8s();
@@ -87,13 +104,13 @@ impl Metrics {
 
         let object = object! {
             "fs" => object!{
-                "events" => fs.read_events(),
-                "creates" => fs.read_creates(),
-                "deletes" => fs.read_deletes(),
-                "writes" => fs.read_writes(),
-                "lines" => fs.read_lines(),
-                "bytes" => fs.read_bytes(),
-                "partial_reads" => fs.read_partial_reads(),
+                "events" => FS_EVENTS.with_label_values(labels::FS_ALL).get(),
+                "creates" => FS_EVENTS.with_label_values(&[labels::CREATE]).get(),
+                "deletes" => FS_EVENTS.with_label_values(&[labels::DELETE]).get(),
+                "writes" => FS_EVENTS.with_label_values(&[labels::WRITE]).get(),
+                "lines" => FS_LINES.get(),
+                "bytes" => FS_BYTES.get(),
+                "partial_reads" => FS_PARTIAL_READS.get(),
             },
             "memory" => object!{
                 "active" => memory.read_active(),
@@ -125,93 +142,38 @@ impl Metrics {
 }
 
 #[derive(Default)]
-pub struct Fs {
-    events: AtomicU64,
-    creates: AtomicU64,
-    deletes: AtomicU64,
-    writes: AtomicU64,
-    lines: AtomicU64,
-    bytes: AtomicU64,
-    partial_reads: AtomicU64,
-}
+pub struct Fs {}
 
 impl Fs {
     pub fn new() -> Self {
-        Self {
-            events: AtomicU64::new(0),
-            creates: AtomicU64::new(0),
-            deletes: AtomicU64::new(0),
-            writes: AtomicU64::new(0),
-            lines: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-            partial_reads: AtomicU64::new(0),
-        }
+        Self {}
     }
 
-    pub fn reset(&self) {
-        self.events.store(0, Ordering::Relaxed);
-        self.creates.store(0, Ordering::Relaxed);
-        self.deletes.store(0, Ordering::Relaxed);
-        self.writes.store(0, Ordering::Relaxed);
-        self.lines.store(0, Ordering::Relaxed);
-        self.bytes.store(0, Ordering::Relaxed);
-        self.partial_reads.store(0, Ordering::Relaxed);
-    }
-
-    pub fn increment_events(&self) {
-        self.events.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_events(&self) -> u64 {
-        self.events.load(Ordering::Relaxed)
-    }
+    // TODO: Remove
+    fn reset(&self) {}
 
     pub fn increment_creates(&self) {
-        self.creates.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_creates(&self) -> u64 {
-        self.creates.load(Ordering::Relaxed)
+        FS_EVENTS.with_label_values(&[labels::CREATE]).inc();
     }
 
     pub fn increment_deletes(&self) {
-        self.deletes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_deletes(&self) -> u64 {
-        self.deletes.load(Ordering::Relaxed)
+        FS_EVENTS.with_label_values(&[labels::DELETE]).inc();
     }
 
     pub fn increment_writes(&self) {
-        self.writes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_writes(&self) -> u64 {
-        self.writes.load(Ordering::Relaxed)
+        FS_EVENTS.with_label_values(&[labels::WRITE]).inc();
     }
 
     pub fn increment_lines(&self) {
-        self.lines.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_lines(&self) -> u64 {
-        self.lines.load(Ordering::Relaxed)
+        FS_LINES.inc();
     }
 
     pub fn add_bytes(&self, num: u64) {
-        self.bytes.fetch_add(num, Ordering::Relaxed);
-    }
-
-    pub fn read_bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+        FS_BYTES.inc_by(num);
     }
 
     pub fn increment_partial_reads(&self) {
-        self.partial_reads.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_partial_reads(&self) -> u64 {
-        self.partial_reads.load(Ordering::Relaxed)
+        FS_PARTIAL_READS.inc();
     }
 }
 

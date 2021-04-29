@@ -16,7 +16,6 @@ use std::{fmt, io};
 
 use futures::{Stream, StreamExt};
 use inotify::WatchDescriptor;
-use metrics::Metrics;
 use slotmap::{DefaultKey, SlotMap};
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::HashMap;
@@ -223,7 +222,6 @@ impl FileSystem {
     fn process(&mut self, watch_event: WatchEvent, events: &mut Vec<Event>) {
         let _entries = self.entries.clone();
         let mut _entries = _entries.borrow_mut();
-        Metrics::fs().increment_events();
 
         debug!("handling inotify event {:#?}", watch_event);
 
