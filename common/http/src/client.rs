@@ -172,7 +172,6 @@ impl Client {
         self.last_flush = Instant::now();
 
         Metrics::http().add_request_size(buffer_size);
-        Metrics::http().increment_requests();
         let body = buffer.end().expect("Failed to close ingest buffer");
         self.make_request(IngestBodyBuffer::from_buffer(body)).await;
     }

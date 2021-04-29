@@ -1,28 +1,48 @@
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use chrono::Utc;
 use jemalloc_ctl::stats::{active, active_mib, allocated, allocated_mib, resident, resident_mib};
 use jemalloc_ctl::{epoch, epoch_mib};
 use json::object;
 use lazy_static::lazy_static;
 use log::info;
-use prometheus::{register_int_counter, register_int_counter_vec};
-use prometheus::{IntCounter, IntCounterVec};
+use prometheus::{
+    register_histogram, register_int_counter, register_int_counter_vec, Histogram, IntCounter,
+    IntCounterVec,
+};
 use std::thread::sleep;
 use std::time::Duration;
 
 lazy_static! {
     static ref METRICS: Metrics = Metrics::new();
-    pub static ref FS_EVENTS: IntCounterVec =
+    static ref FS_EVENTS: IntCounterVec =
         register_int_counter_vec!("fs_events", "Filesystem events received", labels::FS_ALL)
             .unwrap();
-    pub static ref FS_LINES: IntCounter =
+    static ref FS_LINES: IntCounter =
         register_int_counter!("fs_lines", "Filesystem lines parsed").unwrap();
-    pub static ref FS_BYTES: IntCounter =
+    static ref FS_BYTES: IntCounter =
         register_int_counter!("fs_bytes", "Filesystem bytes read").unwrap();
-    pub static ref FS_PARTIAL_READS: IntCounter =
+    static ref FS_PARTIAL_READS: IntCounter =
         register_int_counter!("fs_partial_reads", "Filesystem partial reads").unwrap();
+    static ref INGEST_RETRIES: IntCounter = register_int_counter!(
+        "ingest_retries",
+        "Retry attempts made to the http ingestion service"
+    )
+    .unwrap();
+    static ref INGEST_RATE_LIMIT_HITS: IntCounter = register_int_counter!(
+        "ingest_rate_limit_hits",
+        "Number of times the http request was delayed due to the rate limiter"
+    )
+    .unwrap();
+    static ref INGEST_REQUESTS: Histogram = register_histogram!(
+        "ingest_requests",
+        "Size of the requests made to http ingestion service"
+    )
+    .unwrap();
+    static ref K8S_EVENTS: IntCounterVec =
+        register_int_counter_vec!("k8s_events", "Kubernetes events received", labels::K8S_ALL)
+            .unwrap();
+    static ref K8S_LINES: IntCounter =
+        register_int_counter!("fs_lines", "Kubernetes event lines read").unwrap();
+    static ref JOURNAL_RECORDS: Histogram =
+        register_histogram!("journald_records", "Size of the Journald log entries read").unwrap();
 }
 
 mod labels {
@@ -30,10 +50,10 @@ mod labels {
     pub const DELETE: &str = "delete";
     pub const WRITE: &str = "write";
     pub static FS_ALL: &[&str] = &[CREATE, WRITE, DELETE];
+    pub static K8S_ALL: &[&str] = &[CREATE, DELETE];
 }
 
 pub struct Metrics {
-    last_flush: AtomicI64,
     fs: Fs,
     memory: Memory,
     http: Http,
@@ -44,7 +64,6 @@ pub struct Metrics {
 impl Metrics {
     fn new() -> Self {
         Self {
-            last_flush: AtomicI64::new(Utc::now().timestamp()),
             fs: Fs::new(),
             memory: Memory::new(),
             http: Http::new(),
@@ -57,23 +76,7 @@ impl Metrics {
         loop {
             sleep(Duration::from_secs(60));
             info!("{}", Metrics::print());
-            Metrics::reset();
         }
-    }
-
-    pub fn reset() {
-        METRICS
-            .last_flush
-            .store(Utc::now().timestamp(), Ordering::Relaxed);
-        Metrics::fs().reset();
-        Metrics::memory().reset();
-        Metrics::http().reset();
-        Metrics::k8s().reset();
-        Metrics::journald().reset();
-    }
-
-    pub fn elapsed() -> u64 {
-        (Utc::now().timestamp() - METRICS.last_flush.load(Ordering::Relaxed)) as u64
     }
 
     pub fn fs() -> &'static Fs {
@@ -98,9 +101,6 @@ impl Metrics {
 
     pub fn print() -> String {
         let memory = Metrics::memory();
-        let http = Metrics::http();
-        let k8s = Metrics::k8s();
-        let journald = Metrics::journald();
 
         let object = object! {
             "fs" => object!{
@@ -112,28 +112,29 @@ impl Metrics {
                 "bytes" => FS_BYTES.get(),
                 "partial_reads" => FS_PARTIAL_READS.get(),
             },
+            // CPU and memory metrics are exported to Prometheus by default only on linux.
+            // We still rely on jemalloc stats for this periodic printing the memory metrics
+            // as it supports more platforms
             "memory" => object!{
                 "active" => memory.read_active(),
                 "allocated" => memory.read_allocated(),
                 "resident" => memory.read_resident(),
             },
             "ingest" => object!{
-                "requests" => http.read_requests(),
-                "throughput" => http.read_request_size(),
-                "rate_limits" => http.read_limit_hits(),
-                "retries" => http.read_retries(),
+                "requests" => INGEST_REQUESTS.get_sample_count(),
+                "requests_size" => INGEST_REQUESTS.get_sample_sum(),
+                "rate_limits" => INGEST_RATE_LIMIT_HITS.get(),
+                "retries" => INGEST_RETRIES.get(),
             },
             "k8s" => object!{
-                "lines" => k8s.read_lines(),
-                "polls" => k8s.read_polls(),
-                "creates" => k8s.read_creates(),
-                "deletes" => k8s.read_deletes(),
-                "events" => k8s.read_events(),
-                "notifies" => k8s.read_notifies(),
+                "lines" => K8S_LINES.get(),
+                "creates" => K8S_EVENTS.with_label_values(&[labels::CREATE]).get(),
+                "deletes" => K8S_EVENTS.with_label_values(&[labels::DELETE]).get(),
+                "events" => K8S_EVENTS.with_label_values(labels::K8S_ALL).get(),
             },
             "journald" => object!{
-                "lines" => journald.read_lines(),
-                "bytes" => journald.read_bytes(),
+                "lines" => JOURNAL_RECORDS.get_sample_count(),
+                "bytes" => JOURNAL_RECORDS.get_sample_sum(),
             },
         };
 
@@ -148,9 +149,6 @@ impl Fs {
     pub fn new() -> Self {
         Self {}
     }
-
-    // TODO: Remove
-    fn reset(&self) {}
 
     pub fn increment_creates(&self) {
         FS_EVENTS.with_label_values(&[labels::CREATE]).inc();
@@ -194,8 +192,6 @@ impl Memory {
         }
     }
 
-    pub fn reset(&self) {}
-
     pub fn read_active(&self) -> u64 {
         self.epoch_mib.advance().unwrap();
         self.active_mib.read().unwrap() as u64
@@ -219,175 +215,68 @@ impl Default for Memory {
 }
 
 #[derive(Default)]
-pub struct Http {
-    requests: AtomicU64,
-    limit_hits: AtomicU64,
-    request_size: AtomicU64,
-    retries: AtomicU64,
-}
+pub struct Http {}
 
 impl Http {
     pub fn new() -> Self {
-        Self {
-            requests: AtomicU64::new(0),
-            limit_hits: AtomicU64::new(0),
-            request_size: AtomicU64::new(0),
-            retries: AtomicU64::new(0),
-        }
-    }
-
-    pub fn reset(&self) {
-        self.requests.store(0, Ordering::Relaxed);
-        self.limit_hits.store(0, Ordering::Relaxed);
-        self.request_size.store(0, Ordering::Relaxed);
-        self.retries.store(0, Ordering::Relaxed);
-    }
-
-    pub fn increment_requests(&self) {
-        self.requests.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_requests(&self) -> u64 {
-        self.requests.load(Ordering::Relaxed)
+        Self {}
     }
 
     pub fn increment_limit_hits(&self) {
-        self.limit_hits.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_limit_hits(&self) -> u64 {
-        self.limit_hits.load(Ordering::Relaxed)
+        INGEST_RATE_LIMIT_HITS.inc();
     }
 
     pub fn add_request_size(&self, num: u64) {
-        self.request_size.fetch_add(num, Ordering::Relaxed);
-    }
-
-    pub fn read_request_size(&self) -> u64 {
-        self.request_size.load(Ordering::Relaxed)
+        INGEST_REQUESTS.observe(num as f64);
     }
 
     pub fn increment_retries(&self) {
-        self.retries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_retries(&self) -> u64 {
-        self.retries.load(Ordering::Relaxed)
+        INGEST_RETRIES.inc();
     }
 }
 
 #[derive(Default)]
-pub struct K8s {
-    lines: AtomicU64,
-    polls: AtomicU64,
-    creates: AtomicU64,
-    deletes: AtomicU64,
-    events: AtomicU64,
-    notifies: AtomicU64,
-}
+pub struct K8s {}
 
 impl K8s {
     pub fn new() -> Self {
-        Self {
-            lines: AtomicU64::new(0),
-            polls: AtomicU64::new(0),
-            creates: AtomicU64::new(0),
-            deletes: AtomicU64::new(0),
-            events: AtomicU64::new(0),
-            notifies: AtomicU64::new(0),
-        }
-    }
-
-    pub fn reset(&self) {
-        self.lines.store(0, Ordering::Relaxed);
-        self.polls.store(0, Ordering::Relaxed);
-        self.creates.store(0, Ordering::Relaxed);
-        self.deletes.store(0, Ordering::Relaxed);
-        self.events.store(0, Ordering::Relaxed);
-        self.notifies.store(0, Ordering::Relaxed);
+        Self {}
     }
 
     pub fn increment_lines(&self) {
-        self.lines.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_lines(&self) -> u64 {
-        self.lines.load(Ordering::Relaxed)
-    }
-
-    pub fn increment_polls(&self) {
-        self.polls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_polls(&self) -> u64 {
-        self.polls.load(Ordering::Relaxed)
+        K8S_LINES.inc();
     }
 
     pub fn increment_creates(&self) {
-        self.creates.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_creates(&self) -> u64 {
-        self.creates.load(Ordering::Relaxed)
+        K8S_EVENTS.with_label_values(&[labels::CREATE]).inc();
     }
 
     pub fn increment_deletes(&self) {
-        self.deletes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_deletes(&self) -> u64 {
-        self.deletes.load(Ordering::Relaxed)
-    }
-
-    pub fn increment_events(&self) {
-        self.events.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_events(&self) -> u64 {
-        self.events.load(Ordering::Relaxed)
-    }
-
-    pub fn increment_notifies(&self) {
-        self.notifies.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn read_notifies(&self) -> u64 {
-        self.notifies.load(Ordering::Relaxed)
+        K8S_EVENTS.with_label_values(&[labels::DELETE]).inc();
     }
 }
 
 #[derive(Default)]
-pub struct Journald {
-    lines: AtomicU64,
-    bytes: AtomicU64,
-}
+pub struct Journald {}
 
 impl Journald {
     pub fn new() -> Self {
-        Self {
-            lines: AtomicU64::new(0),
-            bytes: AtomicU64::new(0),
-        }
+        Self {}
     }
 
-    pub fn reset(&self) {
-        self.lines.store(0, Ordering::Relaxed);
-        self.bytes.store(0, Ordering::Relaxed);
+    pub fn add_bytes(&self, num: usize) {
+        JOURNAL_RECORDS.observe(num as f64);
     }
+}
 
-    pub fn increment_lines(&self) {
-        self.lines.fetch_add(1, Ordering::Relaxed);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn read_lines(&self) -> u64 {
-        self.lines.load(Ordering::Relaxed)
-    }
-
-    pub fn add_bytes(&self, num: u64) {
-        self.bytes.fetch_add(num, Ordering::Relaxed);
-    }
-
-    pub fn read_bytes(&self) -> u64 {
-        self.bytes.load(Ordering::Relaxed)
+    #[test]
+    fn fs_events_should_be_incremented_from_labels() {
+        let initial = FS_EVENTS.with_label_values(labels::FS_ALL).get();
+        METRICS.fs.increment_creates();
+        assert_eq!(FS_EVENTS.with_label_values(labels::FS_ALL).get(), initial + 1);
     }
 }
