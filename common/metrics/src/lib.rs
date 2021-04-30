@@ -4,16 +4,16 @@ use json::object;
 use lazy_static::lazy_static;
 use log::info;
 use prometheus::{
-    register_histogram, register_int_counter, register_int_counter_vec, Histogram, IntCounter,
-    IntCounterVec,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    Histogram, HistogramVec, IntCounter, IntCounterVec,
 };
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 lazy_static! {
     static ref METRICS: Metrics = Metrics::new();
     static ref FS_EVENTS: IntCounterVec =
-        register_int_counter_vec!("fs_events", "Filesystem events received", labels::FS_ALL)
+        register_int_counter_vec!("fs_events", "Filesystem events received", &["event_type"])
             .unwrap();
     static ref FS_LINES: IntCounter =
         register_int_counter!("fs_lines", "Filesystem lines parsed").unwrap();
@@ -31,16 +31,22 @@ lazy_static! {
         "Number of times the http request was delayed due to the rate limiter"
     )
     .unwrap();
-    static ref INGEST_REQUESTS: Histogram = register_histogram!(
-        "ingest_requests",
-        "Size of the requests made to http ingestion service"
+    static ref INGEST_REQUEST_SIZE: Histogram = register_histogram!(
+        "ingest_request_size",
+        "Size in bytes of the requests made to http ingestion service"
+    )
+    .unwrap();
+    static ref INGEST_REQUEST_DURATION: HistogramVec = register_histogram_vec!(
+        "ingest_request_duration_millis",
+        "Latency of the requests made to http ingestion service",
+        &["outcome"]
     )
     .unwrap();
     static ref K8S_EVENTS: IntCounterVec =
-        register_int_counter_vec!("k8s_events", "Kubernetes events received", labels::K8S_ALL)
+        register_int_counter_vec!("k8s_events", "Kubernetes events received", &["event_type"])
             .unwrap();
     static ref K8S_LINES: IntCounter =
-        register_int_counter!("fs_lines", "Kubernetes event lines read").unwrap();
+        register_int_counter!("k8s_lines", "Kubernetes event lines read").unwrap();
     static ref JOURNAL_RECORDS: Histogram =
         register_histogram!("journald_records", "Size of the Journald log entries read").unwrap();
 }
@@ -49,8 +55,9 @@ mod labels {
     pub const CREATE: &str = "create";
     pub const DELETE: &str = "delete";
     pub const WRITE: &str = "write";
-    pub static FS_ALL: &[&str] = &[CREATE, WRITE, DELETE];
-    pub static K8S_ALL: &[&str] = &[CREATE, DELETE];
+    pub const SUCCESS: &str = "success";
+    pub const FAILURE: &str = "failure";
+    pub const TIMEOUT: &str = "timeout";
 }
 
 pub struct Metrics {
@@ -102,12 +109,21 @@ impl Metrics {
     pub fn print() -> String {
         let memory = Metrics::memory();
 
+        let fs_create = FS_EVENTS.with_label_values(&[labels::CREATE]).get();
+        let fs_delete = FS_EVENTS.with_label_values(&[labels::DELETE]).get();
+        let fs_write = FS_EVENTS.with_label_values(&[labels::WRITE]).get();
+        let k8s_create = K8S_EVENTS.with_label_values(&[labels::CREATE]).get();
+        let k8s_delete = K8S_EVENTS.with_label_values(&[labels::DELETE]).get();
+        let latency_success = INGEST_REQUEST_DURATION.with_label_values(&[labels::SUCCESS]);
+        let latency_failure = INGEST_REQUEST_DURATION.with_label_values(&[labels::FAILURE]);
+        let latency_timeout = INGEST_REQUEST_DURATION.with_label_values(&[labels::TIMEOUT]);
+
         let object = object! {
             "fs" => object!{
-                "events" => FS_EVENTS.with_label_values(labels::FS_ALL).get(),
-                "creates" => FS_EVENTS.with_label_values(&[labels::CREATE]).get(),
-                "deletes" => FS_EVENTS.with_label_values(&[labels::DELETE]).get(),
-                "writes" => FS_EVENTS.with_label_values(&[labels::WRITE]).get(),
+                "events" => fs_create + fs_delete + fs_write,
+                "creates" => fs_create,
+                "deletes" => fs_delete,
+                "writes" => fs_write,
                 "lines" => FS_LINES.get(),
                 "bytes" => FS_BYTES.get(),
                 "partial_reads" => FS_PARTIAL_READS.get(),
@@ -121,16 +137,22 @@ impl Metrics {
                 "resident" => memory.read_resident(),
             },
             "ingest" => object!{
-                "requests" => INGEST_REQUESTS.get_sample_count(),
-                "requests_size" => INGEST_REQUESTS.get_sample_sum(),
+                "requests" => INGEST_REQUEST_SIZE.get_sample_count(),
+                "requests_size" => INGEST_REQUEST_SIZE.get_sample_sum(),
                 "rate_limits" => INGEST_RATE_LIMIT_HITS.get(),
                 "retries" => INGEST_RETRIES.get(),
+                // The request duration is exported as a histogram in Prometheus,
+                // in this output is a simple sum
+                "requests_duration" => latency_success.get_sample_sum() + latency_failure.get_sample_sum() + latency_timeout.get_sample_sum(),
+                "requests_timed_out" => latency_timeout.get_sample_count(),
+                "requests_failed" => latency_failure.get_sample_count(),
+                "requests_succeeded" => latency_success.get_sample_count(),
             },
             "k8s" => object!{
                 "lines" => K8S_LINES.get(),
-                "creates" => K8S_EVENTS.with_label_values(&[labels::CREATE]).get(),
-                "deletes" => K8S_EVENTS.with_label_values(&[labels::DELETE]).get(),
-                "events" => K8S_EVENTS.with_label_values(labels::K8S_ALL).get(),
+                "creates" => k8s_create,
+                "deletes" => k8s_delete,
+                "events" => k8s_create + k8s_delete,
             },
             "journald" => object!{
                 "lines" => JOURNAL_RECORDS.get_sample_count(),
@@ -227,7 +249,25 @@ impl Http {
     }
 
     pub fn add_request_size(&self, num: u64) {
-        INGEST_REQUESTS.observe(num as f64);
+        INGEST_REQUEST_SIZE.observe(num as f64);
+    }
+
+    pub fn add_request_success(&self, start: Instant) {
+        INGEST_REQUEST_DURATION
+            .with_label_values(&[labels::SUCCESS])
+            .observe(elapsed(start))
+    }
+
+    pub fn add_request_failure(&self, start: Instant) {
+        INGEST_REQUEST_DURATION
+            .with_label_values(&[labels::FAILURE])
+            .observe(elapsed(start))
+    }
+
+    pub fn add_request_timeout(&self, start: Instant) {
+        INGEST_REQUEST_DURATION
+            .with_label_values(&[labels::TIMEOUT])
+            .observe(elapsed(start))
     }
 
     pub fn increment_retries(&self) {
@@ -269,14 +309,41 @@ impl Journald {
     }
 }
 
+fn elapsed(start: Instant) -> f64 {
+    start.elapsed().as_micros() as f64 / 1_000.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Sub;
 
+    /// Verifies that increments/marks and printing does not panic
     #[test]
-    fn fs_events_should_be_incremented_from_labels() {
-        let initial = FS_EVENTS.with_label_values(labels::FS_ALL).get();
+    fn print_should_return_json() {
         METRICS.fs.increment_creates();
-        assert_eq!(FS_EVENTS.with_label_values(labels::FS_ALL).get(), initial + 1);
+        METRICS.fs.increment_deletes();
+        METRICS.fs.increment_writes();
+        METRICS.fs.increment_lines();
+        METRICS.fs.increment_partial_reads();
+        METRICS.fs.add_bytes(123);
+        METRICS.http.add_request_size(12);
+        METRICS
+            .http
+            .add_request_success(Instant::now().sub(Duration::from_micros(8137)));
+        METRICS
+            .http
+            .add_request_failure(Instant::now().sub(Duration::from_micros(1137)));
+        METRICS
+            .http
+            .add_request_timeout(Instant::now().sub(Duration::from_micros(20137)));
+        METRICS.http.increment_limit_hits();
+        METRICS.http.increment_retries();
+        METRICS.journald.add_bytes(32);
+        METRICS.k8s.increment_lines();
+        METRICS.k8s.increment_deletes();
+        METRICS.k8s.increment_creates();
+        let result = Metrics::print();
+        assert!(result.starts_with('{') && result.ends_with('}'));
     }
 }
